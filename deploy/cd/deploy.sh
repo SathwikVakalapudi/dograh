@@ -67,6 +67,49 @@ services:
 YAML
 }
 
+db_revision() {
+    local pg
+    pg=$(docker ps -qf name=postgres)
+    [[ -n "$pg" ]] || { echo ""; return; }
+    docker exec "$pg" psql -U postgres -tAc \
+        'select version_num from alembic_version;' 2>/dev/null | tr -d '[:space:]'
+}
+
+# The head the image would migrate to. Read from the image rather than from
+# this host, because the image is what actually runs `alembic upgrade head`.
+# The connection details are deliberately unusable: `alembic heads` only reads
+# the versions directory, and a reachable URL here would risk touching a
+# database while merely reporting.
+image_head() {
+    docker run --rm -w /app/api \
+        -e DATABASE_URL="postgresql+asyncpg://unused:unused@127.0.0.1:1/unused" \
+        -e REDIS_URL="redis://127.0.0.1:6379/0" \
+        -e ENABLE_AWS_S3=false \
+        -e MINIO_PUBLIC_ENDPOINT="http://127.0.0.1:9000" \
+        -e DEPLOYMENT_MODE=oss \
+        --entrypoint alembic "$1" heads 2>/dev/null \
+        | awk '{print $1}' | head -1
+}
+
+# Says plainly whether this deploy changes the schema. A deploy that is
+# migration-neutral is far cheaper to reason about than one that is not, and
+# the difference should never be a surprise discovered afterwards.
+migration_report() {
+    local ref="$1" cur target
+    cur=$(db_revision)
+    target=$(image_head "$ref")
+    echo "  database revision : ${cur:-unknown}"
+    echo "  image head        : ${target:-could not determine}"
+    if [[ -z "$target" ]]; then
+        echo "  -> could not read the image's head; entrypoint will still run 'alembic upgrade head'"
+    elif [[ "$cur" == "$target" ]]; then
+        echo "  -> MIGRATION-NEUTRAL: schema already at the image's head, nothing will apply"
+    else
+        echo "  -> SCHEMA CHANGE: the entrypoint will migrate $cur -> $target"
+        echo "     a pre-deploy dump is taken in step 3; migrations are forward-only"
+    fi
+}
+
 current_image() {
     docker inspect dograh-api-1 --format '{{.Config.Image}}' 2>/dev/null || echo ""
 }
@@ -87,6 +130,25 @@ do_rollback() {
     fi
     fail "ROLLBACK ALSO UNHEALTHY -- manual intervention required. Stack left running on $prev."
 }
+
+# Read-only. Answers "what would happen?" without changing anything, so the
+# call check and the migration delta can be reviewed before an approval.
+if [[ "${1:-}" == "preflight" ]]; then
+    REF="${3:-}"; [[ -n "${2:-}" && -n "$REF" ]] && REF="${3}:${2}"
+    say "preflight (read-only, nothing will be changed)"
+    echo "  deploy dir        : $DEPLOY_DIR"
+    echo "  running image     : $(current_image)"
+    ACTIVE=$(asterisk -rx 'core show channels' 2>/dev/null | awk '/active calls/{print $1}' || echo 0)
+    echo "  active calls      : ${ACTIVE:-unknown}$([[ "${ACTIVE:-0}" != "0" ]] && echo '   <- deploy would be REFUSED without --force')"
+    if [[ -n "$REF" ]] && docker image inspect "$REF" >/dev/null 2>&1; then
+        migration_report "$REF"
+    else
+        echo "  database revision : $(db_revision)"
+        echo "  image head        : target image not present locally; pull it to compare"
+    fi
+    echo "  SIP registrations : $(asterisk -rx 'pjsip show registrations' 2>/dev/null | grep -c Registered || echo 0)"
+    exit 0
+fi
 
 if [[ "${1:-}" == "rollback" ]]; then
     do_rollback
@@ -142,6 +204,10 @@ docker pull "$NEW_REF"
 PULLED_SHA=$(docker run --rm --entrypoint printenv "$NEW_REF" GIT_SHA 2>/dev/null || echo "")
 [[ "$PULLED_SHA" == "$SHA" ]] || fail "image reports GIT_SHA='$PULLED_SHA', expected '$SHA'"
 echo "  image confirms GIT_SHA=$PULLED_SHA"
+
+# ── 4b. say what this does to the schema ──────────────────────────────────
+say "4b. migration check"
+migration_report "$NEW_REF"
 
 # ── 5. swap only the api service ──────────────────────────────────────────
 say "5. recreate api"
