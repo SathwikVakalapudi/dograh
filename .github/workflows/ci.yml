@@ -12,8 +12,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/dograh-api
+# github.repository_owner keeps the account's original casing, but a Docker
+# repository name must be lowercase, so it is lowercased per job below.
 
 jobs:
   # ---------------------------------------------------------------- tests
@@ -180,6 +180,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Compute lowercase image name
+        id: img
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/$owner/dograh-api" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         # Pull requests from forks get a read-only token, so only publish on
         # pushes to the baseline. PRs still build, they just do not push.
@@ -199,8 +205,8 @@ jobs:
           # Immutable sha tag is what CD deploys and what rollback returns to.
           # The moving tag is a convenience for humans, never for deployment.
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.IMAGE_NAME }}:baseline
+            ${{ steps.img.outputs.name }}:${{ github.sha }}
+            ${{ steps.img.outputs.name }}:baseline
           build-args: |
             GIT_SHA=${{ github.sha }}
           cache-from: type=gha
@@ -211,7 +217,7 @@ jobs:
         # comparing build_sha is meaningful rather than always "unknown".
         run: |
           built=$(docker run --rm --entrypoint printenv \
-            ${{ env.IMAGE_NAME }}:${{ github.sha }} GIT_SHA)
+            ${{ steps.img.outputs.name }}:${{ github.sha }} GIT_SHA)
           echo "image GIT_SHA: $built"
           [ "$built" = "${{ github.sha }}" ] || {
             echo "::error::image reports '$built', expected '${{ github.sha }}'"
@@ -224,7 +230,7 @@ jobs:
             echo "### Image"
             echo ""
             echo '```'
-            echo "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            echo "${{ steps.img.outputs.name }}:${{ github.sha }}"
             echo '```'
             echo ""
             echo "Published: ${{ github.event_name == 'push' }}"
