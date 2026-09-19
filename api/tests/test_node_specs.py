@@ -247,6 +247,11 @@ def test_all_registered_node_models_inherit_base_node_data():
                 "extraction_variables",
                 "tool_uuids",
                 "document_uuids",
+                # Recorded openings: an agent node carries the same greeting
+                # trio as the start node, appended so existing order is stable.
+                "greeting_type",
+                "greeting",
+                "greeting_recording_id",
             ],
         ),
         (

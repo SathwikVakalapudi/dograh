@@ -69,6 +69,20 @@ export interface AgentNode {
      * LLM hint: List of document UUIDs from `list_documents`.
      */
     document_uuids?: string[];
+    /**
+     * Whether this step's opening line is spoken via TTS from text or played from a pre-recorded audio file.
+     */
+    greeting_type?: "text" | "audio";
+    /**
+     * Text spoken via TTS when this step begins. Supports {{template_variables}}. Leave empty to let the LLM open the step.
+     */
+    greeting?: string;
+    /**
+     * Pre-recorded audio file played when this step begins.
+     *
+     * LLM hint: Value is the `recording_id` string. Use the `list_recordings` MCP tool to discover available recordings.
+     */
+    greeting_recording_id?: string;
 }
 
 /** Factory — sets `type` for you so you don't repeat the discriminator. */

@@ -94,3 +94,20 @@ class AgentNode(TypedNode):
     Documents the agent can reference during this step.
     """
 
+    greeting_type: Literal['text', 'audio'] = 'text'
+    """
+    Whether this step's opening line is spoken via TTS from text or played
+    from a pre-recorded audio file.
+    """
+
+    greeting: Optional[str] = None
+    """
+    Text spoken via TTS when this step begins. Supports
+    {{template_variables}}. Leave empty to let the LLM open the step.
+    """
+
+    greeting_recording_id: Optional[str] = None
+    """
+    Pre-recorded audio file played when this step begins.
+    """
+
