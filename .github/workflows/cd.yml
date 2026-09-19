@@ -1,0 +1,127 @@
+name: CD
+
+# Manual only, on purpose. Every push to production-baseline already builds and
+# publishes an image; choosing to put one on the phone system stays a human
+# decision. The `production` environment adds a required-reviewer gate on top,
+# so a mistyped dispatch still cannot deploy on its own.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-char commit SHA to deploy (must already be built by CI)"
+        required: true
+        type: string
+      force:
+        description: "Deploy even if calls are in progress (drops them)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # Never let two deploys touch the VM at once.
+  group: cd-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify image exists
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.img.outputs.name }}
+    steps:
+      - name: Validate the SHA looks like a commit
+        run: |
+          [[ "${{ inputs.sha }}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::sha must be a full 40-character commit hash"; exit 1; }
+
+      - name: Compute lowercase image name
+        id: img
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/$owner/dograh-api" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image must already exist and carry that commit
+        # Fails before the production environment is even requested, so a
+        # reviewer is never asked to approve a deploy that cannot work.
+        run: |
+          ref="${{ steps.img.outputs.name }}:${{ inputs.sha }}"
+          docker pull "$ref"
+          built=$(docker run --rm --entrypoint printenv "$ref" GIT_SHA)
+          echo "image GIT_SHA: $built"
+          [ "$built" = "${{ inputs.sha }}" ] || {
+            echo "::error::image reports '$built', expected '${{ inputs.sha }}'"; exit 1; }
+
+  deploy:
+    name: Deploy to production
+    needs: verify
+    runs-on: ubuntu-latest
+    # Requires the reviewers configured on the `production` environment.
+    # The job pauses here until somebody approves it.
+    environment:
+      name: production
+      url: https://65-20-85-40.sslip.io
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open an SSH session to the VM
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          # Written straight to a file, never echoed, never passed as an argv.
+          printf '%s\n' "${{ secrets.DOGRAH_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # Pinning the host key stops this job trusting whatever answers on
+          # that address -- it is the SIP host, so identity matters.
+          printf '%s\n' "${{ secrets.DOGRAH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Ship the deploy script
+        run: |
+          scp -i ~/.ssh/id_deploy deploy/cd/deploy.sh \
+            "${{ secrets.DOGRAH_USER }}@${{ secrets.DOGRAH_HOST }}:/opt/dograh/deploy.sh"
+          ssh -i ~/.ssh/id_deploy \
+            "${{ secrets.DOGRAH_USER }}@${{ secrets.DOGRAH_HOST }}" \
+            'chmod +x /opt/dograh/deploy.sh'
+
+      - name: Let the VM pull from GHCR
+        # Read-only PAT with read:packages. Piped on stdin so the token never
+        # appears in a process list on the VM.
+        run: |
+          ssh -i ~/.ssh/id_deploy \
+            "${{ secrets.DOGRAH_USER }}@${{ secrets.DOGRAH_HOST }}" \
+            "docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin" \
+            <<< "${{ secrets.GHCR_PULL_TOKEN }}"
+
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/id_deploy \
+            "${{ secrets.DOGRAH_USER }}@${{ secrets.DOGRAH_HOST }}" \
+            "/opt/dograh/deploy.sh ${{ inputs.sha }} ${{ needs.verify.outputs.image }} ${{ inputs.force && '--force' || '' }}"
+
+      - name: Record what is running
+        if: always()
+        run: |
+          {
+            echo "### Production"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${{ inputs.sha }}\` |"
+            echo "| image | \`${{ needs.verify.outputs.image }}:${{ inputs.sha }}\` |"
+            echo "| result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revoke the VM's registry credentials
+        # The token is not needed once the image is pulled; leaving it in
+        # /root/.docker/config.json would outlive the deploy.
+        if: always()
+        run: |
+          ssh -i ~/.ssh/id_deploy \
+            "${{ secrets.DOGRAH_USER }}@${{ secrets.DOGRAH_HOST }}" \
+            'docker logout ghcr.io >/dev/null 2>&1 || true'
