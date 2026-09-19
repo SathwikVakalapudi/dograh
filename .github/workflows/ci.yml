@@ -1,0 +1,231 @@
+name: CI
+
+# Guards the production baseline. The inherited upstream workflows all target
+# main, releases or discussions, so none of them cover this branch.
+on:
+  pull_request:
+    branches: [production-baseline]
+  push:
+    branches: [production-baseline]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/dograh-api
+
+jobs:
+  # ---------------------------------------------------------------- tests
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # pgvector, not plain postgres: dc33eef8dabe_add_document_tables.py runs
+        # CREATE EXTENSION vector.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+    env:
+      # api/conftest.py creates test_db through the postgres admin database.
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/test_db
+      REDIS_URL: redis://localhost:6379/0
+      ENABLE_AWS_S3: "false"
+      # storage.py builds MinioFileSystem at import time and needs this set,
+      # even though no test actually talks to MinIO.
+      MINIO_PUBLIC_ENDPOINT: http://localhost:9000
+      DEPLOYMENT_MODE: oss
+      ENVIRONMENT: test
+      LOG_LEVEL: DEBUG
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout (with pipecat submodule)
+        uses: actions/checkout@v4
+        with:
+          # Without this pipecat/ is empty and the api package cannot import.
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node 22 (test_ts_bridge.py shells out to node)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Create virtualenv
+        run: |
+          python -m venv .venv
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install api + pipecat dependencies
+        run: ./scripts/setup_requirements.sh --dev
+
+      - name: Install ts_validator npm deps
+        working-directory: api/mcp_server/ts_validator
+        run: npm install
+
+      - name: Import check
+        # Catches a broken module before pytest spends minutes collecting, and
+        # catches references to names the pinned pipecat no longer exports --
+        # the class of bug that shipped EndTaskReason.USER_QUALIFIED to prod.
+        run: |
+          python -c "import api.app"
+          python -c "from api.services.workflow.node_specs import all_specs; print('node specs:', len(all_specs()))"
+
+      - name: Run test suite
+        working-directory: api
+        # No -x: report every failure, not just the first.
+        run: pytest tests/ -v
+
+  # ----------------------------------------------------------- migrations
+  migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/test_db
+      REDIS_URL: redis://localhost:6379/0
+      ENABLE_AWS_S3: "false"
+      MINIO_PUBLIC_ENDPOINT: http://localhost:9000
+      DEPLOYMENT_MODE: oss
+      ENVIRONMENT: test
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Create virtualenv
+        run: |
+          python -m venv .venv
+          echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: ./scripts/setup_requirements.sh --dev
+
+      - name: Exactly one head
+        working-directory: api
+        # Two heads make "alembic upgrade head" ambiguous and it fails at deploy
+        # time, not here. Catch it on the PR that introduces the branch instead.
+        run: |
+          heads=$(alembic heads | grep -c . || true)
+          echo "alembic heads: $heads"
+          alembic heads
+          if [ "$heads" -ne 1 ]; then
+            echo "::error::expected exactly 1 head, found $heads -- merge the branches"
+            exit 1
+          fi
+
+      - name: Fresh database upgrades to head
+        working-directory: api
+        run: alembic upgrade head
+
+      - name: Report resulting revision
+        working-directory: api
+        run: |
+          echo "revision after upgrade: $(alembic current | head -1)"
+
+  # ---------------------------------------------------------------- image
+  build:
+    name: Docker image
+    needs: [test, migrations]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # GITHUB_TOKEN pushes to GHCR; no registry secrets to manage.
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Pull requests from forks get a read-only token, so only publish on
+        # pushes to the baseline. PRs still build, they just do not push.
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and publish on push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: api/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          # Immutable sha tag is what CD deploys and what rollback returns to.
+          # The moving tag is a convenience for humans, never for deployment.
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:baseline
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the image reports the right commit
+        # Proves GIT_SHA actually reached the image, so a later health check
+        # comparing build_sha is meaningful rather than always "unknown".
+        run: |
+          built=$(docker run --rm --entrypoint printenv \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }} GIT_SHA)
+          echo "image GIT_SHA: $built"
+          [ "$built" = "${{ github.sha }}" ] || {
+            echo "::error::image reports '$built', expected '${{ github.sha }}'"
+            exit 1
+          }
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image"
+            echo ""
+            echo '```'
+            echo "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+            echo '```'
+            echo ""
+            echo "Published: ${{ github.event_name == 'push' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
