@@ -290,7 +290,7 @@ class TestEndCallViaNodeTransition:
         assert len(test_helper.end_call_reasons) >= 1, (
             "end_call_with_reason should have been called"
         )
-        assert EndTaskReason.USER_QUALIFIED.value in test_helper.end_call_reasons
+        assert EndTaskReason.END_CALL.value in test_helper.end_call_reasons
 
         # Verify pipeline was muted
         assert any(test_helper.mute_pipeline_state), "Pipeline should be muted"
@@ -389,7 +389,7 @@ class TestEndCallViaNodeTransition:
 
         # Verify end_call_with_reason was called
         assert len(test_helper.end_call_reasons) >= 1
-        assert EndTaskReason.USER_QUALIFIED.value in test_helper.end_call_reasons
+        assert EndTaskReason.END_CALL.value in test_helper.end_call_reasons
 
         # Verify pipeline was muted and call disposed
         assert any(test_helper.mute_pipeline_state), "Pipeline should be muted"
@@ -477,11 +477,11 @@ class TestEndCallViaCustomTool:
 
                 await asyncio.gather(run_pipeline(), initialize_engine())
 
-        # Verify end_call_with_reason was called with END_CALL_TOOL_REASON
+        # Verify end_call_with_reason was called with END_CALL
         assert len(test_helper.end_call_reasons) >= 1, (
             "end_call_with_reason should have been called"
         )
-        assert EndTaskReason.END_CALL_TOOL_REASON.value in test_helper.end_call_reasons
+        assert EndTaskReason.END_CALL.value in test_helper.end_call_reasons
 
         # Verify pipeline was muted
         assert any(test_helper.mute_pipeline_state), "Pipeline should be muted"
@@ -567,7 +567,7 @@ class TestEndCallViaCustomTool:
         assert len(test_helper.end_call_reasons) >= 1, (
             "end_call_with_reason should have been called"
         )
-        assert EndTaskReason.END_CALL_TOOL_REASON.value in test_helper.end_call_reasons
+        assert EndTaskReason.END_CALL.value in test_helper.end_call_reasons
 
         # Verify pipeline was muted
         assert any(test_helper.mute_pipeline_state), "Pipeline should be muted"
@@ -727,11 +727,11 @@ class TestEndCallRaceConditions:
                             EndTaskReason.USER_HANGUP.value, abort_immediately=True
                         ),
                         engine.end_call_with_reason(
-                            EndTaskReason.END_CALL_TOOL_REASON.value,
+                            EndTaskReason.END_CALL.value,
                             abort_immediately=True,
                         ),
                         engine.end_call_with_reason(
-                            EndTaskReason.USER_QUALIFIED.value,
+                            EndTaskReason.END_CALL.value,
                             abort_immediately=False,
                         ),
                     )
