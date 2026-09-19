@@ -1,0 +1,15 @@
+services:
+  postgres: { restart: unless-stopped }
+  redis:    { restart: unless-stopped }
+  minio:    { restart: unless-stopped }
+  nginx:    { restart: unless-stopped }
+  ui:       { restart: unless-stopped }
+  api:
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: dograh-local/dograh-api:local
+    pull_policy: never
+    environment:
+      ARQ_WORKERS: "1"
