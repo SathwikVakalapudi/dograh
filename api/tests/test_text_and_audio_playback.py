@@ -6,12 +6,15 @@ Verifies that:
 - Covers: start node greetings, edge transition speech, tool config messages
 """
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from pipecat.frames.frames import (
     Frame,
+    FunctionCallResultProperties,
     LLMContextFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -30,6 +33,7 @@ from pipecat.transports.base_transport import TransportParams
 
 from api.services.pipecat.recording_audio_cache import RecordingAudio
 from api.services.workflow.dto import (
+    AgentNodeData,
     EdgeDataDTO,
     EndCallNodeData,
     Position,
@@ -753,3 +757,741 @@ class TestPlayConfigMessage:
 
         assert result is False
         assert len(mock_engine._queued_frames) == 0
+
+
+# ─── Tests: Recorded Node Openings on Transition ────────────────
+
+AGENT_OPENING_ID = "202"
+# Transition tool names are derived from the edge label (transition_tool_name).
+AGENT_TRANSITION_TOOL = "qualify"
+
+
+def _recording_audio_frames(frames: List[Frame]) -> List[TTSAudioRawFrame]:
+    """Audio frames that came from the recording, not from the mock TTS."""
+    return [
+        f
+        for f in frames
+        if isinstance(f, TTSAudioRawFrame) and f.audio == FAKE_PCM_AUDIO
+    ]
+
+
+def _recorded_opening_workflow(
+    *, opening_recording_id: str | None = AGENT_OPENING_ID
+) -> WorkflowGraph:
+    """Start -> Agent -> End, where the Agent node owns a recorded opening.
+
+    The Start->Agent edge carries no transition speech so the only audio in the
+    run comes from the destination node's opening.
+    """
+    agent_data: dict[str, Any] = {
+        "name": "Qualify",
+        "prompt": "Agent System Prompt",
+        "allow_interrupt": True,
+        "add_global_prompt": False,
+        "extraction_enabled": False,
+    }
+    if opening_recording_id is not None:
+        agent_data["greeting_type"] = "audio"
+        agent_data["greeting_recording_id"] = opening_recording_id
+
+    dto = ReactFlowDTO(
+        nodes=[
+            RFNodeDTO(
+                id="start",
+                type="startCall",
+                position=Position(x=0, y=0),
+                data=StartCallNodeData(
+                    name="Start Call",
+                    prompt=START_PROMPT,
+                    is_start=True,
+                    allow_interrupt=False,
+                    add_global_prompt=False,
+                    extraction_enabled=False,
+                ),
+            ),
+            RFNodeDTO(
+                id="agent",
+                type="agentNode",
+                position=Position(x=0, y=200),
+                data=AgentNodeData(**agent_data),
+            ),
+            RFNodeDTO(
+                id="end",
+                type="endCall",
+                position=Position(x=0, y=400),
+                data=EndCallNodeData(
+                    name="End Call",
+                    prompt=END_PROMPT,
+                    is_end=True,
+                    allow_interrupt=False,
+                    add_global_prompt=False,
+                    extraction_enabled=False,
+                ),
+            ),
+        ],
+        edges=[
+            RFEdgeDTO(
+                id="start-agent",
+                source="start",
+                target="agent",
+                data=EdgeDataDTO(
+                    label="Qualify",
+                    condition="When the user is ready to be qualified",
+                ),
+            ),
+            RFEdgeDTO(
+                id="agent-end",
+                source="agent",
+                target="end",
+                data=EdgeDataDTO(
+                    label="End Call",
+                    condition="When the user says end the call",
+                ),
+            ),
+        ],
+    )
+    return WorkflowGraph(dto)
+
+
+class TestRecordedNodeOpening:
+    """The recorded opening replaces LLM #2 only on a successful transition."""
+
+    @pytest.mark.asyncio
+    async def test_recorded_opening_plays_once_and_suppresses_second_llm(self):
+        """Transition into a node with a recording: audio plays, LLM #2 does not run."""
+        mock_fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+
+        llm, context, queued_frames = await run_pipeline_and_capture_frames(
+            workflow=_recorded_opening_workflow(),
+            functions=[
+                {
+                    "name": AGENT_TRANSITION_TOOL,
+                    "arguments": {},
+                    "tool_call_id": "call_transition",
+                }
+            ],
+            fetch_recording_audio=mock_fetch,
+            num_text_steps=2,
+        )
+
+        # The whole point: only the first generation ran. Without the recording
+        # this is 2 (see test_no_recording_falls_back_to_second_llm below).
+        assert llm.get_current_step() == 1, (
+            "LLM #2 should be suppressed when a recorded opening was queued"
+        )
+
+        mock_fetch.assert_called_once_with(recording_pk=int(AGENT_OPENING_ID))
+
+        started = [f for f in queued_frames if isinstance(f, TTSStartedFrame)]
+        audio = [f for f in queued_frames if isinstance(f, TTSAudioRawFrame)]
+        assert len(started) == 1, "recorded opening must play exactly once"
+        assert len(audio) == 1
+        assert audio[0].audio == FAKE_PCM_AUDIO
+
+    @pytest.mark.asyncio
+    async def test_no_recording_falls_back_to_second_llm(self):
+        """Without a configured opening the existing two-call behaviour is kept."""
+        mock_fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+
+        llm, context, queued_frames = await run_pipeline_and_capture_frames(
+            workflow=_recorded_opening_workflow(opening_recording_id=None),
+            functions=[
+                {
+                    "name": AGENT_TRANSITION_TOOL,
+                    "arguments": {},
+                    "tool_call_id": "call_transition",
+                }
+            ],
+            fetch_recording_audio=mock_fetch,
+            num_text_steps=2,
+        )
+
+        assert llm.get_current_step() == 2, "LLM #2 must still run without a recording"
+        mock_fetch.assert_not_called()
+        assert _recording_audio_frames(queued_frames) == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_falls_back_to_second_llm(self):
+        """A recording that cannot be fetched must not silence the turn."""
+        mock_fetch = AsyncMock(return_value=None)
+
+        llm, context, queued_frames = await run_pipeline_and_capture_frames(
+            workflow=_recorded_opening_workflow(),
+            functions=[
+                {
+                    "name": AGENT_TRANSITION_TOOL,
+                    "arguments": {},
+                    "tool_call_id": "call_transition",
+                }
+            ],
+            fetch_recording_audio=mock_fetch,
+            num_text_steps=2,
+        )
+
+        mock_fetch.assert_called_once()
+        assert llm.get_current_step() == 2, "failed fetch must fall back to LLM #2"
+        assert _recording_audio_frames(queued_frames) == []
+
+    @pytest.mark.asyncio
+    async def test_fetch_raising_falls_back_to_second_llm(self):
+        """An exception from the fetcher must not fail the transition."""
+        mock_fetch = AsyncMock(side_effect=RuntimeError("storage down"))
+
+        llm, context, queued_frames = await run_pipeline_and_capture_frames(
+            workflow=_recorded_opening_workflow(),
+            functions=[
+                {
+                    "name": AGENT_TRANSITION_TOOL,
+                    "arguments": {},
+                    "tool_call_id": "call_transition",
+                }
+            ],
+            fetch_recording_audio=mock_fetch,
+            num_text_steps=2,
+        )
+
+        assert llm.get_current_step() == 2, "raising fetch must fall back to LLM #2"
+        assert _recording_audio_frames(queued_frames) == []
+
+
+class TestOpeningEpoch:
+    """Exactly-once semantics for a node's opening, at the engine level."""
+
+    def _engine(self, fetch) -> PipecatEngine:
+        engine = PipecatEngine(
+            llm=Mock(),
+            context=LLMContext(),
+            workflow=_recorded_opening_workflow(),
+            call_context_vars={},
+            workflow_run_id=1,
+        )
+        engine.set_fetch_recording_audio(fetch)
+        transport_output = Mock()
+        transport_output.queue_frame = AsyncMock()
+        engine.set_transport_output(transport_output)
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_concurrent_openings_play_once(self):
+        """Two handlers racing on one node entry produce a single playback."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._opening_epoch = 1  # simulate a single set_node()
+
+        results = await asyncio.gather(
+            engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            ),
+            engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            ),
+        )
+
+        assert sorted(results) == ["greeting", "none"], (
+            "exactly one caller may claim the opening"
+        )
+        fetch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_second_call_after_playback_is_suppressed(self):
+        """A late duplicate for the same entry must not replay the recording."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._opening_epoch = 1
+
+        first = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+        second = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+
+        assert first == "greeting"
+        assert second == "none"
+        fetch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_node_revisit_gets_a_fresh_opening(self):
+        """Re-entering the node later in the call plays the opening again."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+
+        engine._opening_epoch = 1
+        first = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+        engine._opening_epoch = 2  # a later set_node() into the same node
+        second = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+
+        assert first == "greeting"
+        assert second == "greeting"
+        assert fetch.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_consumes_the_epoch(self):
+        """A broken recording must not be retried for the same node entry."""
+        fetch = AsyncMock(return_value=None)
+        engine = self._engine(fetch)
+        engine._opening_epoch = 1
+
+        assert (
+            await engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            )
+            == "none"
+        )
+        assert (
+            await engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            )
+            == "none"
+        )
+        fetch.assert_called_once()
+
+
+class TestRunLlmContract:
+    """The vendored pipecat contract this optimization depends on."""
+
+    @pytest.mark.asyncio
+    async def test_run_llm_false_suppresses_inference_but_still_runs_callback(self):
+        """run_llm=False must stop the generation and still fire on_context_updated.
+
+        Exercised against the installed pipecat aggregator via pipecat's own
+        run_test harness (which wires the task manager), not a mock, because
+        end-of-call handling rides on on_context_updated.
+        """
+        from pipecat.frames.frames import (
+            FunctionCallInProgressFrame,
+            FunctionCallResultFrame,
+        )
+        from pipecat.tests.utils import SleepFrame, run_test
+
+        called = asyncio.Event()
+
+        async def on_context_updated() -> None:
+            called.set()
+
+        aggregator = LLMContextAggregatorPair(LLMContext()).assistant()
+
+        in_progress = FunctionCallInProgressFrame(
+            function_name=AGENT_TRANSITION_TOOL,
+            tool_call_id="call_1",
+            arguments={},
+        )
+        result = FunctionCallResultFrame(
+            function_name=AGENT_TRANSITION_TOOL,
+            tool_call_id="call_1",
+            arguments={},
+            result={"status": "done"},
+            properties=FunctionCallResultProperties(
+                run_llm=False,
+                on_context_updated=on_context_updated,
+            ),
+        )
+
+        # SleepFrame keeps the pipeline alive long enough for the
+        # on_context_updated task to run: the EndFrame run_test sends afterwards
+        # cancels any callback task still in flight.
+        _, received_up = await run_test(
+            aggregator,
+            frames_to_send=[in_progress, result, SleepFrame(sleep=0.3)],
+            expected_down_frames=[],
+        )
+
+        # on_context_updated still runs, so end-of-call handling survives.
+        assert called.is_set(), "on_context_updated must still fire when run_llm=False"
+
+        # ...and no context frame was pushed upstream, i.e. LLM #2 never ran.
+        assert not [f for f in received_up if isinstance(f, LLMContextFrame)], (
+            "run_llm=False must not push a context frame (must not run LLM #2)"
+        )
+
+
+class TestParallelTransitions:
+    """One LLM response emitting two transition tool calls.
+
+    pipecat runs function calls with run_in_parallel=True, so both handlers
+    execute and each performs its own set_node(). Only the node that is still
+    current may speak its opening.
+    """
+
+    def _engine(self, fetch) -> PipecatEngine:
+        engine = PipecatEngine(
+            llm=Mock(),
+            context=LLMContext(),
+            workflow=_recorded_opening_workflow(),
+            call_context_vars={},
+            workflow_run_id=1,
+        )
+        engine.set_fetch_recording_audio(fetch)
+        transport_output = Mock()
+        transport_output.queue_frame = AsyncMock()
+        engine.set_transport_output(transport_output)
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_losing_node_does_not_speak(self):
+        """A transition whose node was superseded must not play its opening."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+
+        # Handler B won the race: "agent" is no longer the current node.
+        engine._current_node = engine.workflow.nodes["end"]
+        engine._opening_epoch = 3
+
+        result = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+
+        assert result == "none", "superseded node must not speak"
+        fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_loser_does_not_consume_the_winners_epoch(self):
+        """The superseded handler must leave the epoch for the winner.
+
+        Regression guard for check-ordering: if the winner-check ran *after* the
+        epoch CAS, the loser would consume the shared epoch and silence the
+        node that actually won.
+        """
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._current_node = engine.workflow.nodes["agent"]
+        engine._opening_epoch = 3
+
+        loser = await engine.queue_node_opening(
+            node_id="end", previous_node_id="start", generate_if_no_greeting=False
+        )
+        winner = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+
+        assert loser == "none"
+        assert winner == "greeting", "winner must still be able to speak"
+        fetch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_different_nodes_play_at_most_once(self):
+        """Racing openings for two different nodes never both play."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._current_node = engine.workflow.nodes["agent"]
+        engine._opening_epoch = 2
+
+        results = await asyncio.gather(
+            engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            ),
+            engine.queue_node_opening(
+                node_id="end", previous_node_id="start", generate_if_no_greeting=False
+            ),
+        )
+
+        assert results.count("greeting") <= 1, "at most one opening may be spoken"
+        assert fetch.call_count <= 1
+
+
+class TestOpeningSampleRates:
+    """The opening must carry the pipeline sample rate for both transports."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sample_rate", [8000, 16000])
+    async def test_opening_uses_pipeline_sample_rate(self, sample_rate: int):
+        """8 kHz telephony and 16 kHz WebRTC both flow through one code path."""
+        from api.services.pipecat.audio_config import AudioConfig
+
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = PipecatEngine(
+            llm=Mock(),
+            context=LLMContext(),
+            workflow=_recorded_opening_workflow(),
+            call_context_vars={},
+            workflow_run_id=1,
+        )
+        engine.set_fetch_recording_audio(fetch)
+        engine.set_audio_config(
+            AudioConfig(
+                transport_in_sample_rate=sample_rate,
+                transport_out_sample_rate=sample_rate,
+                vad_sample_rate=16000,
+            )
+        )
+        queued: list = []
+        transport_output = Mock()
+
+        async def _capture(frame, *a, **kw):
+            queued.append(frame)
+
+        transport_output.queue_frame = _capture
+        engine.set_transport_output(transport_output)
+        engine._current_node = engine.workflow.nodes["agent"]
+        engine._opening_epoch = 1
+
+        assert (
+            await engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            )
+            == "greeting"
+        )
+
+        audio = [f for f in queued if isinstance(f, TTSAudioRawFrame)]
+        assert len(audio) == 1
+        assert audio[0].sample_rate == sample_rate
+        assert audio[0].num_channels == 1
+
+
+class TestOpeningContextCommit:
+    """The recorded question must enter assistant context exactly once."""
+
+    @pytest.mark.asyncio
+    async def test_opening_frames_request_context_append(self):
+        """play_audio marks the transcript frame append_to_context for the aggregator.
+
+        This is what makes the recorded question the assistant's committed turn,
+        so the next user turn sees it in history and the transcript records it
+        once. A second (LLM-generated) question cannot appear because run_llm is
+        False on this path.
+        """
+        fetch = AsyncMock(
+            return_value=RecordingAudio(
+                audio=FAKE_PCM_AUDIO, transcript="How many employees do you have?"
+            )
+        )
+        engine = PipecatEngine(
+            llm=Mock(),
+            context=LLMContext(),
+            workflow=_recorded_opening_workflow(),
+            call_context_vars={},
+            workflow_run_id=1,
+        )
+        engine.set_fetch_recording_audio(fetch)
+        queued: list = []
+        transport_output = Mock()
+
+        async def _capture(frame, *a, **kw):
+            queued.append(frame)
+
+        transport_output.queue_frame = _capture
+        engine.set_transport_output(transport_output)
+        engine._current_node = engine.workflow.nodes["agent"]
+        engine._opening_epoch = 1
+
+        await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+
+        from pipecat.frames.frames import TTSTextFrame
+
+        text_frames = [f for f in queued if isinstance(f, TTSTextFrame)]
+        assert len(text_frames) == 1, "exactly one assistant transcript frame"
+        assert text_frames[0].text == "How many employees do you have?"
+        assert text_frames[0].append_to_context is True
+
+
+class TestUserSpeakingGuard:
+    """The recorded opening must never start on top of a speaking caller.
+
+    The generation it replaces is gated by pipecat's own
+    `if run_llm and not self._user_speaking` check, which has no recovery path
+    for the user-speaking case. The opening honours the same rule and hands the
+    turn back to that check by leaving run_llm unset.
+    """
+
+    def _engine(self, fetch) -> PipecatEngine:
+        # AsyncMock: set_node() -> _setup_llm_context() awaits on the LLM.
+        engine = PipecatEngine(
+            llm=AsyncMock(),
+            context=LLMContext(),
+            workflow=_recorded_opening_workflow(),
+            call_context_vars={},
+            workflow_run_id=1,
+        )
+        engine.set_fetch_recording_audio(fetch)
+        transport_output = Mock()
+        transport_output.queue_frame = AsyncMock()
+        engine.set_transport_output(transport_output)
+        # Variable extraction is orthogonal to this guard and needs a manager
+        # that only initialize() builds.
+        engine._perform_variable_extraction_if_needed = AsyncMock()
+        engine._current_node = engine.workflow.nodes["agent"]
+        engine._opening_epoch = 1
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_user_speaking_frames_update_engine_state(self):
+        """should_mute_user observes the same two frames pipecat tracks."""
+        from pipecat.frames.frames import (
+            UserStartedSpeakingFrame,
+            UserStoppedSpeakingFrame,
+        )
+
+        engine = self._engine(AsyncMock())
+        assert engine._user_is_speaking is False
+
+        await engine.should_mute_user(UserStartedSpeakingFrame())
+        assert engine._user_is_speaking is True
+
+        await engine.should_mute_user(UserStoppedSpeakingFrame())
+        assert engine._user_is_speaking is False
+
+    @pytest.mark.asyncio
+    async def test_user_speaking_does_not_change_mute_decision(self):
+        """Tracking user speech must not alter who gets muted."""
+        from pipecat.frames.frames import UserStartedSpeakingFrame
+
+        engine = self._engine(AsyncMock())
+        engine._current_node.allow_interrupt = True
+
+        assert await engine.should_mute_user(UserStartedSpeakingFrame()) is False
+
+    @pytest.mark.asyncio
+    async def test_opening_plays_when_user_is_not_speaking(self):
+        """Baseline: the optimisation still applies in the normal case."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._user_is_speaking = False
+
+        assert (
+            await engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            )
+            == "greeting"
+        )
+        fetch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_transition_skips_opening_while_user_speaks(self):
+        """Recording must not start, and LLM fallback must stay enabled."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._user_is_speaking = True
+        # Transition in from the start node: a self-loop would be skipped by the
+        # existing previous_node_id guard and prove nothing about this one.
+        engine._current_node = engine.workflow.nodes["start"]
+
+        captured = {}
+
+        async def result_callback(result, *, properties=None):
+            captured["properties"] = properties
+
+        transition = await engine._create_transition_func("qualify", "agent")
+        await transition(
+            SimpleNamespace(
+                function_name="qualify",
+                tool_call_id="call_1",
+                arguments={},
+                result_callback=result_callback,
+            )
+        )
+
+        fetch.assert_not_called(), "recording must not be fetched or played"
+        assert captured["properties"].run_llm is None, (
+            "skipping for a speaking user must NOT suppress the LLM fallback"
+        )
+        assert captured["properties"].on_context_updated is not None
+
+    @pytest.mark.asyncio
+    async def test_transition_plays_opening_when_user_silent(self):
+        """The same path suppresses LLM #2 once the caller is quiet."""
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._user_is_speaking = False
+        engine._current_node = engine.workflow.nodes["start"]
+
+        captured = {}
+
+        async def result_callback(result, *, properties=None):
+            captured["properties"] = properties
+
+        transition = await engine._create_transition_func("qualify", "agent")
+        await transition(
+            SimpleNamespace(
+                function_name="qualify",
+                tool_call_id="call_1",
+                arguments={},
+                result_callback=result_callback,
+            )
+        )
+
+        fetch.assert_called_once()
+        assert captured["properties"].run_llm is False
+
+    @pytest.mark.asyncio
+    async def test_recovery_after_user_stops_speaking(self):
+        """User speaks, stops, then a later transition plays normally."""
+        from pipecat.frames.frames import UserStoppedSpeakingFrame
+
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = self._engine(fetch)
+        engine._user_is_speaking = True
+
+        # First transition is skipped while the caller is talking.
+        first = await engine.queue_node_opening(
+            node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+        )
+        assert first == "greeting", (
+            "queue_node_opening itself is unguarded; the guard lives in the "
+            "transition path so the start-node greeting is unaffected"
+        )
+
+        # Caller falls silent; a later node entry plays normally.
+        await engine.should_mute_user(UserStoppedSpeakingFrame())
+        assert engine._user_is_speaking is False
+        engine._opening_epoch = 2
+        assert (
+            await engine.queue_node_opening(
+                node_id="agent", previous_node_id="start", generate_if_no_greeting=False
+            )
+            == "greeting"
+        )
+
+
+class TestOpeningPlaybackFailure:
+    """Playback itself failing must degrade to the LLM path, not to silence.
+
+    Distinct from a failed *fetch*: here the recording resolves but pushing the
+    audio frames raises, e.g. a transport that is tearing down.
+    """
+
+    @pytest.mark.asyncio
+    async def test_playback_exception_falls_back_to_llm(self):
+        fetch = AsyncMock(return_value=RecordingAudio(audio=FAKE_PCM_AUDIO))
+        engine = PipecatEngine(
+            llm=AsyncMock(),
+            context=LLMContext(),
+            workflow=_recorded_opening_workflow(),
+            call_context_vars={},
+            workflow_run_id=1,
+        )
+        engine.set_fetch_recording_audio(fetch)
+        transport_output = Mock()
+        transport_output.queue_frame = AsyncMock(
+            side_effect=RuntimeError("transport gone")
+        )
+        engine.set_transport_output(transport_output)
+        engine._perform_variable_extraction_if_needed = AsyncMock()
+        engine._current_node = engine.workflow.nodes["start"]
+
+        captured = {}
+
+        async def result_callback(result, *, properties=None):
+            captured["properties"] = properties
+
+        transition = await engine._create_transition_func("qualify", "agent")
+        await transition(
+            SimpleNamespace(
+                function_name="qualify",
+                tool_call_id="call_1",
+                arguments={},
+                result_callback=result_callback,
+            )
+        )
+
+        # The transition still succeeds and the LLM fallback stays enabled.
+        assert captured["properties"] is not None, (
+            "playback failure must not turn the transition into an error result"
+        )
+        assert captured["properties"].run_llm is None
+        assert captured["properties"].on_context_updated is not None

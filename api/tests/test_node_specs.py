@@ -323,6 +323,9 @@ def test_all_registered_node_models_inherit_base_node_data():
             [
                 "name",
                 "prompt",
+                "greeting_type",
+                "greeting",
+                "greeting_recording_id",
                 "allow_interrupt",
                 "add_global_prompt",
                 "extraction_enabled",

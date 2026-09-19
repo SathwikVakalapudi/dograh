@@ -123,6 +123,41 @@ def build_ttfb_metric_event(
     }
 
 
+LATENCY_BREAKDOWN_EVENT_TYPE = "rtf-latency-breakdown"
+"""Wire type for the per-service latency breakdown.
+
+A literal rather than a ``RealtimeFeedbackType`` member: the installed pipecat
+build does not define ``LATENCY_BREAKDOWN``.
+"""
+
+LATENCY_BREAKDOWN_SCHEMA_VERSION = 1
+
+
+def build_latency_breakdown_event(breakdown: Any) -> dict[str, Any]:
+    """Build the per-service breakdown that accompanies ``rtf-latency-measured``.
+
+    ``breakdown`` is pipecat's ``LatencyBreakdown``. Duration fields are named
+    ``duration_secs`` by pipecat and are passed through unchanged, so consumers
+    must not expect ``duration``. Individual ``ttfb`` entries are preserved so
+    each measurement can be attributed to its processor.
+    """
+    return {
+        "type": LATENCY_BREAKDOWN_EVENT_TYPE,
+        "payload": {
+            "schema_version": LATENCY_BREAKDOWN_SCHEMA_VERSION,
+            "user_turn_secs": breakdown.user_turn_secs,
+            "user_turn_start_time": breakdown.user_turn_start_time,
+            "ttfb": [entry.model_dump() for entry in breakdown.ttfb],
+            "text_aggregation": (
+                breakdown.text_aggregation.model_dump()
+                if breakdown.text_aggregation
+                else None
+            ),
+            "function_calls": [call.model_dump() for call in breakdown.function_calls],
+        },
+    }
+
+
 def build_pipeline_error_event(
     *,
     error: str,

@@ -428,6 +428,9 @@ class StartCallNodeData(
     property_order=(
         "name",
         "prompt",
+        "greeting_type",
+        "greeting",
+        "greeting_recording_id",
         "allow_interrupt",
         "add_global_prompt",
         "extraction_enabled",
@@ -451,6 +454,43 @@ class StartCallNodeData(
             ),
             "placeholder": "Ask the caller about their budget and timeline.",
         },
+        "greeting_type": {
+            "display_name": "Opening Type",
+            "description": (
+                "How this step's opening question is delivered when the agent "
+                "transitions in. Leave as text with an empty opening to have the "
+                "LLM generate the question, as before."
+            ),
+            "options": [
+                PropertyOption(value="text", label="Text (TTS)"),
+                PropertyOption(value="audio", label="Pre-recorded Audio"),
+            ],
+            "spec_default": "text",
+        },
+        "greeting": {
+            "display_name": "Opening Question",
+            "description": (
+                "Canonical question for this step. Supports {{template_variables}}. "
+                "Leave empty to have the LLM generate the question."
+            ),
+            "display_options": DisplayOptions(show={"greeting_type": ["text"]}),
+            "placeholder": "And what's your rough timeline for getting started?",
+            "editor": "textarea",
+        },
+        "greeting_recording_id": {
+            "display_name": "Opening Recording",
+            "description": (
+                "Pre-recorded audio played on entering this step. Skips the LLM "
+                "call that would otherwise only generate this question. Falls back "
+                "to LLM generation if the recording cannot be played."
+            ),
+            "ui_type": PropertyType.recording_ref,
+            "llm_hint": (
+                "Value is the `recording_id` string. Use the `list_recordings` "
+                "MCP tool to discover available recordings."
+            ),
+            "display_options": DisplayOptions(show={"greeting_type": ["audio"]}),
+        },
         "allow_interrupt": {
             "description": (
                 "When true, the user can interrupt the agent mid-utterance. Set "
@@ -472,7 +512,17 @@ class AgentNodeData(
     _ExtractionNodeDataMixin,
     _ToolDocumentRefsMixin,
 ):
-    pass
+    # Canonical opening for this step, read by PipecatEngine.get_node_greeting().
+    # Declared with the same names and types as StartCallNodeData so the existing
+    # greeting model is reused rather than duplicated. All three stay inert when
+    # unset: nodes without an opening keep generating their question via the LLM.
+    greeting: Optional[str] = spec_field(default=None, ui_type=PropertyType.string)
+    greeting_type: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.options
+    )
+    greeting_recording_id: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.recording_ref
+    )
 
 
 @node_spec(

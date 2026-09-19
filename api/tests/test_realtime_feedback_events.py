@@ -1,6 +1,15 @@
+import pytest
+from pipecat.observers.user_bot_latency_observer import (
+    FunctionCallMetrics,
+    LatencyBreakdown,
+    TextAggregationBreakdownMetrics,
+    TTFBBreakdownMetrics,
+)
+
 from api.services.pipecat.realtime_feedback_events import (
     build_bot_text_event,
     build_function_call_end_event,
+    build_latency_breakdown_event,
     build_node_transition_event,
     build_user_transcription_event,
     realtime_feedback_event_sort_key,
@@ -90,3 +99,102 @@ def test_transcript_can_include_end_timestamps_without_changing_default_format()
         "[2026-01-01T00:00:06+00:00 -> 2026-01-01T00:00:08+00:00] "
         "user: January fifth\n"
     )
+
+
+def test_build_latency_breakdown_event_populated():
+    """A fully populated breakdown maps to the exact documented wire shape."""
+    breakdown = LatencyBreakdown(
+        ttfb=[
+            TTFBBreakdownMetrics(
+                processor="OpenAILLMService#0",
+                model="gpt-4.1-mini",
+                start_time=1000.0,
+                duration_secs=0.80,
+            ),
+            TTFBBreakdownMetrics(
+                processor="CartesiaTTSService#0",
+                model="sonic-3.5",
+                start_time=1001.9,
+                duration_secs=0.12,
+            ),
+        ],
+        text_aggregation=TextAggregationBreakdownMetrics(
+            processor="CartesiaTTSService#0",
+            start_time=1001.9,
+            duration_secs=0.25,
+        ),
+        user_turn_start_time=999.0,
+        user_turn_secs=1.17,
+        function_calls=[
+            FunctionCallMetrics(
+                function_name="q3_answered",
+                start_time=1000.84,
+                duration_secs=0.0004,
+            )
+        ],
+    )
+
+    assert build_latency_breakdown_event(breakdown) == {
+        "type": "rtf-latency-breakdown",
+        "payload": {
+            "schema_version": 1,
+            "user_turn_secs": 1.17,
+            "user_turn_start_time": 999.0,
+            "ttfb": [
+                {
+                    "processor": "OpenAILLMService#0",
+                    "model": "gpt-4.1-mini",
+                    "start_time": 1000.0,
+                    "duration_secs": 0.80,
+                },
+                {
+                    "processor": "CartesiaTTSService#0",
+                    "model": "sonic-3.5",
+                    "start_time": 1001.9,
+                    "duration_secs": 0.12,
+                },
+            ],
+            "text_aggregation": {
+                "processor": "CartesiaTTSService#0",
+                "start_time": 1001.9,
+                "duration_secs": 0.25,
+            },
+            "function_calls": [
+                {
+                    "function_name": "q3_answered",
+                    "start_time": 1000.84,
+                    "duration_secs": 0.0004,
+                }
+            ],
+        },
+    }
+
+
+def test_build_latency_breakdown_event_empty_optional_fields():
+    """A re-ask turn produces no tool call and may carry no aggregation."""
+    assert build_latency_breakdown_event(LatencyBreakdown()) == {
+        "type": "rtf-latency-breakdown",
+        "payload": {
+            "schema_version": 1,
+            "user_turn_secs": None,
+            "user_turn_start_time": None,
+            "ttfb": [],
+            "text_aggregation": None,
+            "function_calls": [],
+        },
+    }
+
+
+def test_build_latency_breakdown_event_rejects_malformed_breakdown():
+    """A partially populated object raises so the caller can skip the event.
+
+    The pipeline handler wraps this call and logs a warning rather than letting
+    a pipecat schema change surface into the call path.
+    """
+
+    class PartialBreakdown:
+        user_turn_secs = 1.0
+        # user_turn_start_time, ttfb, text_aggregation, function_calls missing
+
+    with pytest.raises(AttributeError):
+        build_latency_breakdown_event(PartialBreakdown())

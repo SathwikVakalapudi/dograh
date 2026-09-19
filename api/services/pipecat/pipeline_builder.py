@@ -37,6 +37,7 @@ def build_pipeline(
     pipeline_metrics_aggregator,
     voicemail_detector=None,
     recording_router=None,
+    deterministic_answer_gate=None,
 ):
     """Build the main pipeline with all components.
 
@@ -48,6 +49,10 @@ def build_pipeline(
         recording_router: Optional RecordingRouterProcessor. When provided,
             inserts between callback processor and TTS to route between
             pre-recorded audio playback and dynamic TTS.
+        deterministic_answer_gate: Optional DeterministicAnswerGate. When provided,
+            sits directly before the LLM so an unambiguous answer can transition
+            without an inference call. Placed after any voicemail LLM gate so
+            classification still wins.
     """
     # Build processors list with optional voicemail detection
     processors = [
@@ -78,6 +83,12 @@ def build_pipeline(
     # determines whether a human or voicemail answered the call.
     if voicemail_detector:
         processors.append(voicemail_detector.llm_gate())
+
+    # Last stop before the LLM: an unambiguous answer transitions here and the
+    # context frame never reaches inference. Anything else passes straight
+    # through, so the LLM path below is unchanged.
+    if deterministic_answer_gate:
+        processors.append(deterministic_answer_gate)
 
     processors.extend(
         [

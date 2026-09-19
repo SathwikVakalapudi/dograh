@@ -417,6 +417,15 @@ def create_stt_service(
                 language=pipecat_language,
             ),
             sample_rate=audio_config.transport_in_sample_rate,
+            # pipecat's SARVAM_TTFS_P99 default of 1.17s is the safety net the
+            # turn-stop strategy waits out before closing the user turn, and
+            # Sarvam never sends finalized=True so it can never be short
+            # circuited. Measured speech-end -> final-transcript latency on this
+            # deployment tops out at 0.777s over 121 samples, so 1.17 adds a
+            # fixed ~0.3s to every turn. 0.85 clears the observed maximum with
+            # ~10% headroom; below 0.80 buys nothing because the strategy's own
+            # user_speech_timeout floor of 0.6s takes over.
+            ttfs_p99_latency=0.85,
         )
     elif user_config.stt.provider == ServiceProviders.SPEACHES.value:
         language = getattr(user_config.stt, "language", None)

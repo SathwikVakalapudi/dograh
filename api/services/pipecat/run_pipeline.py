@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Optional
 
 from fastapi import HTTPException
@@ -28,6 +29,10 @@ from api.services.observability.active_calls import (
     unregister_active_call as unregister_worker_active_call,
 )
 from api.services.pipecat.audio_config import AudioConfig, create_audio_config
+from api.services.pipecat.deterministic_answer_gate import (
+    DeterministicAnswerGate,
+    parse_node_allowlist,
+)
 from api.services.pipecat.event_handlers import (
     register_audio_data_handler,
     register_event_handlers,
@@ -45,6 +50,7 @@ from api.services.pipecat.pipeline_engine_callbacks_processor import (
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
 from api.services.pipecat.pre_call_fetch import execute_pre_call_fetch
 from api.services.pipecat.realtime_feedback_events import (
+    build_latency_breakdown_event,
     build_node_transition_event,
 )
 from api.services.pipecat.realtime_feedback_observer import (
@@ -1038,6 +1044,23 @@ async def _run_pipeline_impl(
             )
         )
 
+    # Skip LLM #1 on unambiguous answers for explicitly allowlisted nodes.
+    # Inert unless DETERMINISTIC_ANSWER_NODES names any, so this is a no-op for
+    # every deployment that has not opted in.
+    deterministic_answer_gate = None
+    if not is_realtime:
+        answer_node_allowlist = parse_node_allowlist(
+            os.getenv("DETERMINISTIC_ANSWER_NODES")
+        )
+        if answer_node_allowlist:
+            logger.info(
+                f"Deterministic answer fast path enabled for nodes: "
+                f"{sorted(answer_node_allowlist)}"
+            )
+            deterministic_answer_gate = DeterministicAnswerGate(
+                engine=engine, allowlist=answer_node_allowlist
+            )
+
     # Build the pipeline
     if is_realtime:
         pipeline = build_realtime_pipeline(
@@ -1063,6 +1086,7 @@ async def _run_pipeline_impl(
             pipeline_metrics_aggregator,
             voicemail_detector=voicemail_detector,
             recording_router=recording_router,
+            deterministic_answer_gate=deterministic_answer_gate,
         )
 
     # Create pipeline task with audio configuration
@@ -1124,6 +1148,36 @@ async def _run_pipeline_impl(
                 await in_memory_logs_buffer.append(message)
             except Exception as e:
                 logger.error(f"Failed to append latency to logs buffer: {e}")
+
+        # Per-service breakdown of the same measurement. pipecat already builds
+        # this object every turn and discards it when nobody subscribes; this
+        # handler only forwards it. No inference, no network, no blocking I/O.
+        @task.user_bot_latency_observer.event_handler("on_latency_breakdown")
+        async def on_latency_breakdown(observer, breakdown):
+            try:
+                message = build_latency_breakdown_event(breakdown)
+            except Exception as e:
+                # A malformed or partially-populated breakdown must never
+                # surface into the call path. Logged at warning because this
+                # signals a pipecat schema change, not a transient failure.
+                logger.warning(f"Failed to build latency breakdown payload: {e}")
+                return
+            if ws_sender:
+                try:
+                    ws_message = message
+                    if in_memory_logs_buffer.current_node_id:
+                        ws_message = {
+                            **message,
+                            "node_id": in_memory_logs_buffer.current_node_id,
+                            "node_name": in_memory_logs_buffer.current_node_name,
+                        }
+                    await ws_sender(ws_message)
+                except Exception as e:
+                    logger.debug(f"Failed to send latency breakdown via WebSocket: {e}")
+            try:
+                await in_memory_logs_buffer.append(message)
+            except Exception as e:
+                logger.error(f"Failed to append latency breakdown to logs buffer: {e}")
 
     # Register turn log handlers for all call types (WebRTC and telephony)
     register_turn_log_handlers(
