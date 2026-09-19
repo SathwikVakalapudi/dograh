@@ -70,6 +70,9 @@ for _integration_router in all_routers():
 class HealthResponse(BaseModel):
     status: str
     version: str
+    # Commit the running image was built from, so a deployment can be
+    # traced to exact source. "unknown" for locally-built images.
+    build_sha: str = "unknown"
     backend_api_endpoint: str
     # Public URL the deployment is reachable at when it sits behind a Cloudflare
     # tunnel (the host has no public IP). null for a directly-reachable deployment.
@@ -92,6 +95,7 @@ async def health() -> HealthResponse:
     from api.constants import (
         APP_VERSION,
         AUTH_PROVIDER,
+        GIT_SHA,
         BACKEND_API_ENDPOINT,
         DEPLOYMENT_MODE,
         ENABLE_SIGNUP,
@@ -119,6 +123,7 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         version=APP_VERSION,
+        build_sha=GIT_SHA,
         backend_api_endpoint=BACKEND_API_ENDPOINT,
         tunnel_url=tunnel_url,
         deployment_mode=DEPLOYMENT_MODE,

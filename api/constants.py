@@ -126,6 +126,10 @@ def _get_version() -> str:
 # Application version (read from pyproject.toml)
 APP_VERSION = _get_version()
 
+# Commit the running image was built from. Baked in by the Docker build so a
+# deployment can be traced back to exact source; "unknown" outside CI builds.
+GIT_SHA = os.getenv("GIT_SHA", "unknown")
+
 # Country code mapping: ISO country code -> international dialing prefix
 COUNTRY_CODES = {
     "US": "1",  # United States

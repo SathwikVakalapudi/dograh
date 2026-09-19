@@ -168,6 +168,11 @@ COPY --chown=dograh:dograh ./docs ./docs
 
 ENV PYTHONPATH=/app
 
+# Commit this image was built from; surfaced by /api/v1/health as build_sha
+# so production can always be traced back to exact source.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 # Disable file logging in Docker - logs go to stdout for docker logs
 ENV LOG_TO_FILE=false
 
