@@ -19,7 +19,11 @@ venv/
 .venv/
 .playwright-mcp
 coturn/
+# Call recordings and scratch audio stay out of git, but the bundled
+# runtime assets under api/assets are required by audio_mixer.py and
+# audio_playback.py -- without them the image builds but plays nothing.
 *.wav
+!api/assets/*.wav
 dograh_pcm_cache/
 node_modules/
 
