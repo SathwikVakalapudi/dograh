@@ -49,6 +49,7 @@ from api.services.pipecat.pipeline_engine_callbacks_processor import (
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
 from api.services.pipecat.pre_call_fetch import execute_pre_call_fetch
 from api.services.pipecat.realtime_feedback_events import (
+    build_latency_breakdown_event,
     build_node_transition_event,
 )
 from api.services.pipecat.realtime_feedback_observer import (
@@ -1126,6 +1127,42 @@ async def _run_pipeline_impl(
                 await in_memory_logs_buffer.append(message)
             except Exception as e:
                 logger.error(f"Failed to append latency to logs buffer: {e}")
+
+        # Per-service breakdown of the same measurement, so a slow turn can be
+        # attributed to STT, the LLM or TTS instead of guessed at. pipecat
+        # already builds this object every turn and discards it when nobody
+        # subscribes, so this handler only forwards it: no inference, no
+        # network, no blocking I/O.
+        @task.user_bot_latency_observer.event_handler("on_latency_breakdown")
+        async def on_latency_breakdown(observer, breakdown):
+            try:
+                message = build_latency_breakdown_event(breakdown)
+            except Exception as e:
+                # A malformed or partially-populated breakdown must never
+                # surface into the call path. Warning rather than debug because
+                # this signals a pipecat schema change, not a transient blip.
+                logger.warning(f"Failed to build latency breakdown payload: {e}")
+                return
+            if ws_sender:
+                try:
+                    ws_message = message
+                    if in_memory_logs_buffer.current_node_id:
+                        ws_message = {
+                            **message,
+                            "node_id": in_memory_logs_buffer.current_node_id,
+                            "node_name": in_memory_logs_buffer.current_node_name,
+                        }
+                    await ws_sender(ws_message)
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to send latency breakdown via WebSocket: {e}"
+                    )
+            try:
+                await in_memory_logs_buffer.append(message)
+            except Exception as e:
+                logger.error(
+                    f"Failed to append latency breakdown to logs buffer: {e}"
+                )
 
     # Register turn log handlers for all call types (WebRTC and telephony)
     register_turn_log_handlers(
