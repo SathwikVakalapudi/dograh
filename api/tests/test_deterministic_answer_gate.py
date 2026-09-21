@@ -69,6 +69,40 @@ class TestParseParty:
         """More than one party matched means we must not guess."""
         assert parse_party(text) is None
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "सुख को।",       # what Sarvam actually returned on run 18
+            "सुख को",
+            "सुखु",
+            "सुक्खु",
+        ],
+    )
+    def test_stt_variants_of_the_himachal_cm_resolve_to_inc(self, text):
+        """Sarvam splits or shortens सुक्खू, and the split form matched nothing.
+
+        Run 18: the caller answered "सुख को।" -- the sitting Congress chief
+        minister -- and it was recorded as "No answer". The canonical spelling
+        is already in the keyword list; only these transcriptions are not.
+        """
+        assert parse_party(text) == "INC"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "सुख मिला",      # "found happiness" -- सुख is an everyday word
+            "बहुत सुख है",
+        ],
+    )
+    def test_bare_sukh_is_not_a_party(self, text):
+        """सुख alone means happiness, so it must not be a keyword on its own.
+
+        This is the risk the fix has to avoid: widening the CM's name far
+        enough to swallow an ordinary Hindi word would make the fast path
+        advance the survey on something that is not an answer at all.
+        """
+        assert parse_party(text) is None
+
     def test_matches_whole_words_only(self):
         """Substring matching would fire on 'हाथ' inside a longer word."""
         assert parse_party("हाथ") == "INC"

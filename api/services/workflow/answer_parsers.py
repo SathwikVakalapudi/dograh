@@ -68,6 +68,16 @@ _PARTY_KEYWORDS: list[tuple[str, list[str]]] = [
             "पंजा",
             "राहुल",
             "सुक्खू",
+            # Sarvam does not reliably produce the canonical spelling of the
+            # sitting chief minister's name. On run 18 it split it into two
+            # words and the answer was recorded as "No answer". Only these
+            # transcriptions are added -- bare "सुख" is deliberately absent
+            # because it is the ordinary Hindi word for happiness, and matching
+            # it would let the fast path advance on something that is not an
+            # answer at all.
+            "सुख को",
+            "सुखु",
+            "सुक्खु",
             "सुखविंदर",
             "प्रतिभा",
             "विक्रमादित्य",
