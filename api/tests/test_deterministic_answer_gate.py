@@ -298,3 +298,59 @@ class TestGate:
             )
         )
         assert DeterministicAnswerGate._last_user_text(frame) == "दूसरा"
+
+
+# ─── Engine contract ────────────────────────────────────────────
+
+class TestEngineContract:
+    """The gate calls into PipecatEngine by name. Those calls are not exercised
+    by the mocked tests above, so a missing method only surfaces on a live call
+    -- which is exactly what happened: the gate matched, raised
+    AttributeError: 'PipecatEngine' object has no attribute 'execute_transition',
+    and silently fell back to the LLM on every fast-path hit.
+    """
+
+    def test_engine_exposes_everything_the_gate_calls(self):
+        import inspect
+
+        from api.services.workflow.pipecat_engine import PipecatEngine
+
+        for attr in (
+            "execute_transition",
+            "_destination_has_recorded_opening",
+            "_user_is_speaking",
+            "_current_node",
+        ):
+            assert hasattr(PipecatEngine, attr) or attr in inspect.getsource(
+                PipecatEngine.__init__
+            ), f"PipecatEngine is missing {attr!r}, which DeterministicAnswerGate calls"
+
+    def test_execute_transition_accepts_the_kwargs_the_gate_passes(self):
+        import inspect
+
+        from api.services.workflow.pipecat_engine import PipecatEngine
+
+        params = inspect.signature(PipecatEngine.execute_transition).parameters
+        for kwarg in (
+            "transition_to_node",
+            "transition_speech",
+            "transition_speech_type",
+            "transition_speech_recording_id",
+        ):
+            assert kwarg in params, f"execute_transition cannot accept {kwarg!r}"
+
+    @pytest.mark.asyncio
+    async def test_match_completes_the_transition_without_reaching_the_llm(self):
+        """A successful fast path must both transition and withhold the frame.
+
+        The earlier bug still logged "matched", so asserting on the log would
+        have passed while every transition failed. Assert the effect instead.
+        """
+        node = _node("Q4 Vote Now", [_edge("q4_answered", "6"), _edge("end_call", "9")])
+        gate, engine, pushed = _gate(node)
+
+        await _run(gate, _frame("कांग्रेस"))
+
+        engine.execute_transition.assert_awaited_once()
+        assert engine.execute_transition.await_args.kwargs["transition_to_node"] == "6"
+        assert pushed == [], "frame reached the LLM despite a successful transition"

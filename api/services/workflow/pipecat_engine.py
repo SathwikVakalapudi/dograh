@@ -256,78 +256,12 @@ class PipecatEngine:
             logger.info(f"Arguments: {function_call_params.arguments}")
 
             try:
-                # Perform variable extraction before transitioning to new node
-                await self._perform_variable_extraction_if_needed(self._current_node)
-
-                # Queue transition speech/audio before switching nodes
-                speech_type = transition_speech_type or "text"
-                if (
-                    speech_type == "audio"
-                    and transition_speech_recording_id
-                    and self._fetch_recording_audio
-                ):
-                    logger.info(
-                        f"Playing transition audio: {transition_speech_recording_id}"
-                    )
-                    self._queued_speech_mute_state = "waiting"
-                    result = await self._fetch_recording_audio(
-                        recording_pk=int(transition_speech_recording_id)
-                    )
-                    if result:
-                        await play_audio(
-                            result.audio,
-                            sample_rate=self._audio_config.pipeline_sample_rate
-                            if self._audio_config
-                            else 16000,
-                            queue_frame=self._transport_output.queue_frame,
-                            transcript=result.transcript,
-                            persist_to_logs=True,
-                        )
-                    else:
-                        logger.warning(
-                            f"Failed to fetch transition audio {transition_speech_recording_id}"
-                        )
-                elif transition_speech:
-                    logger.info(f"Playing transition speech: {transition_speech}")
-                    self._queued_speech_mute_state = "waiting"
-                    await self.task.queue_frame(
-                        TTSSpeakFrame(
-                            transition_speech,
-                            append_to_context=False,
-                            persist_to_logs=True,
-                        )
-                    )
-
-                # Set context for the new node, so that when the function call result
-                # frame is received by LLMContextAggregator and an LLM generation
-                # is done, we have updated context and functions
-                # Captured before set_node so queue_node_opening can tell a real
-                # node change from a re-entry into the same node.
-                source_node_id = (
-                    self._current_node.id if self._current_node else None
+                opening = await self.execute_transition(
+                    transition_to_node=transition_to_node,
+                    transition_speech=transition_speech,
+                    transition_speech_type=transition_speech_type,
+                    transition_speech_recording_id=transition_speech_recording_id,
                 )
-
-                await self.set_node(transition_to_node)
-
-                # Play the destination's recorded/text opening if it has one.
-                # "greeting" means something was queued, so the LLM must not
-                # also speak the question.
-                #
-                # Skipped while the caller is talking: starting the recording
-                # now would speak over them, and unlike the LLM generation it
-                # replaces there is no gate further down to stop it. Leaving
-                # opening at "none" hands the turn back to the normal LLM path,
-                # which is exactly the behaviour before recorded openings.
-                if self._user_is_speaking:
-                    logger.debug(
-                        f"User is speaking, skipping recorded opening for {transition_to_node}"
-                    )
-                    opening = "none"
-                else:
-                    opening = await self.queue_node_opening(
-                        node_id=transition_to_node,
-                        previous_node_id=source_node_id,
-                    )
 
                 async def on_context_updated() -> None:
                     """
@@ -368,6 +302,105 @@ class PipecatEngine:
                 await function_call_params.result_callback(error_result)
 
         return transition_func
+
+    async def execute_transition(
+        self,
+        *,
+        transition_to_node: str,
+        transition_speech: Optional[str] = None,
+        transition_speech_type: Optional[str] = None,
+        transition_speech_recording_id: Optional[str] = None,
+    ) -> Literal["none", "greeting", "llm"]:
+        """Move the conversation to *transition_to_node* and open that node.
+
+        Shared by the LLM tool-call path and the deterministic fast path so both
+        run identical extraction, transition-speech, node-swap and opening
+        logic. Transition speech belongs here rather than in a node prompt: an
+        acknowledgement the model merely speaks can be said without the
+        transition happening, which is exactly the Q6 "ओके, अगला सवाल।" bug.
+
+        End-node teardown is deliberately not here: the tool-call path must run
+        it from on_context_updated once the function result is in context, which
+        has no equivalent on the fast path.
+
+        Returns what queue_node_opening reported, so a caller that owns a
+        function-call result can decide whether to suppress the follow-up LLM
+        generation.
+        """
+        # Perform variable extraction before transitioning to new node
+        await self._perform_variable_extraction_if_needed(self._current_node)
+
+        # Queue transition speech/audio before switching nodes
+        speech_type = transition_speech_type or "text"
+        if (
+            speech_type == "audio"
+            and transition_speech_recording_id
+            and self._fetch_recording_audio
+        ):
+            logger.info(
+                f"Playing transition audio: {transition_speech_recording_id}"
+            )
+            self._queued_speech_mute_state = "waiting"
+            result = await self._fetch_recording_audio(
+                recording_pk=int(transition_speech_recording_id)
+            )
+            if result:
+                await play_audio(
+                    result.audio,
+                    sample_rate=self._audio_config.pipeline_sample_rate
+                    if self._audio_config
+                    else 16000,
+                    queue_frame=self._transport_output.queue_frame,
+                    transcript=result.transcript,
+                    persist_to_logs=True,
+                )
+            else:
+                logger.warning(
+                    f"Failed to fetch transition audio {transition_speech_recording_id}"
+                )
+        elif transition_speech:
+            logger.info(f"Playing transition speech: {transition_speech}")
+            self._queued_speech_mute_state = "waiting"
+            await self.task.queue_frame(
+                TTSSpeakFrame(
+                    transition_speech,
+                    append_to_context=False,
+                    persist_to_logs=True,
+                )
+            )
+
+        # Set context for the new node, so that when the function call result
+        # frame is received by LLMContextAggregator and an LLM generation
+        # is done, we have updated context and functions
+        # Captured before set_node so queue_node_opening can tell a real
+        # node change from a re-entry into the same node.
+        source_node_id = (
+            self._current_node.id if self._current_node else None
+        )
+
+        await self.set_node(transition_to_node)
+
+        # Play the destination's recorded/text opening if it has one.
+        # "greeting" means something was queued, so the LLM must not
+        # also speak the question.
+        #
+        # Skipped while the caller is talking: starting the recording
+        # now would speak over them, and unlike the LLM generation it
+        # replaces there is no gate further down to stop it. Leaving
+        # opening at "none" hands the turn back to the normal LLM path,
+        # which is exactly the behaviour before recorded openings.
+        if self._user_is_speaking:
+            logger.debug(
+                f"User is speaking, skipping recorded opening for {transition_to_node}"
+            )
+            opening = "none"
+        else:
+            opening = await self.queue_node_opening(
+                node_id=transition_to_node,
+                previous_node_id=source_node_id,
+            )
+
+        return opening
 
     async def _register_transition_function_with_llm(
         self,
