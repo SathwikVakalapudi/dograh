@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Optional
 
 from fastapi import HTTPException
@@ -32,6 +33,10 @@ from api.services.pipecat.event_handlers import (
     register_event_handlers,
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
+from api.services.pipecat.deterministic_answer_gate import (
+    DeterministicAnswerGate,
+    parse_node_allowlist,
+)
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -948,6 +953,26 @@ async def _run_pipeline_impl(
     voicemail_detector = None
     recording_router = None
 
+    # Skip the LLM on unambiguous answers for explicitly allowlisted nodes.
+    # Inert unless DETERMINISTIC_ANSWER_NODES names any, so a deployment that
+    # does not set it behaves exactly as if this processor did not exist.
+    # Voice only: the gate commits a transition by swallowing the context frame,
+    # which relies on the destination speaking from a recording, and the
+    # text-chat surface has no transport output to play one.
+    deterministic_answer_gate = None
+    if not is_realtime:
+        answer_node_allowlist = parse_node_allowlist(
+            os.getenv("DETERMINISTIC_ANSWER_NODES")
+        )
+        if answer_node_allowlist:
+            logger.info(
+                f"Deterministic answer fast path enabled for nodes: "
+                f"{sorted(answer_node_allowlist)}"
+            )
+            deterministic_answer_gate = DeterministicAnswerGate(
+                engine=engine, allowlist=answer_node_allowlist
+            )
+
     # Create recording audio fetcher (used by recording router, audio greetings,
     # and audio transition speech)
     fetch_audio = create_recording_audio_fetcher(
@@ -1039,6 +1064,7 @@ async def _run_pipeline_impl(
             pipeline_metrics_aggregator,
             voicemail_detector=voicemail_detector,
             recording_router=recording_router,
+            deterministic_answer_gate=deterministic_answer_gate,
         )
 
     # Create pipeline task with audio configuration
