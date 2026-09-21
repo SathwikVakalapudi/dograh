@@ -356,6 +356,13 @@ def create_stt_service(
                 language=pipecat_language,
             ),
             sample_rate=audio_config.transport_in_sample_rate,
+            # The turn gate waits max(user_speech_timeout, ttfs_p99 - vad_stop_secs)
+            # after the caller stops, so the stock SARVAM_TTFS_P99 of 1.17 costs
+            # max(0.6, 0.97) = 0.97s of dead air every turn. 121 measured samples
+            # put Sarvam's p90 at 0.411s and its worst at 0.777s, so 0.85 still
+            # clears the slowest observed response and the 0.6s policy floor keeps
+            # the gate from collapsing: max(0.6, 0.65) = 0.65s.
+            ttfs_p99_latency=0.85,
         )
     elif user_config.stt.provider == ServiceProviders.SPEACHES.value:
         language = getattr(user_config.stt, "language", None)
