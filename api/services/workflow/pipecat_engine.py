@@ -9,6 +9,8 @@ from pipecat.frames.frames import (
     FunctionCallResultProperties,
     LLMContextFrame,
     TTSSpeakFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -119,6 +121,18 @@ class PipecatEngine:
 
         # Tracks whether the bot is currently speaking (for allow_interrupt logic)
         self._bot_is_speaking: bool = False
+
+        # Tracks whether the caller is currently speaking. Read only by the
+        # recorded-opening path so a recording never starts over them; it
+        # deliberately does not influence the mute decision.
+        self._user_is_speaking: bool = False
+
+        # A node entry earns exactly one opening. The epoch is bumped on every
+        # set_node and consumed by whichever handler queues the opening, so two
+        # transition tool calls racing for the same entry cannot both play.
+        self._opening_epoch: int = 0
+        self._opening_played_epoch: int = -1
+        self._opening_lock: asyncio.Lock = asyncio.Lock()
 
         # Custom tool manager (initialized in initialize())
         self._custom_tool_manager: Optional[CustomToolManager] = None
@@ -298,10 +312,22 @@ class PipecatEngine:
                 # Play the destination's recorded/text opening if it has one.
                 # "greeting" means something was queued, so the LLM must not
                 # also speak the question.
-                opening = await self.queue_node_opening(
-                    node_id=transition_to_node,
-                    previous_node_id=source_node_id,
-                )
+                #
+                # Skipped while the caller is talking: starting the recording
+                # now would speak over them, and unlike the LLM generation it
+                # replaces there is no gate further down to stop it. Leaving
+                # opening at "none" hands the turn back to the normal LLM path,
+                # which is exactly the behaviour before recorded openings.
+                if self._user_is_speaking:
+                    logger.debug(
+                        f"User is speaking, skipping recorded opening for {transition_to_node}"
+                    )
+                    opening = "none"
+                else:
+                    opening = await self.queue_node_opening(
+                        node_id=transition_to_node,
+                        previous_node_id=source_node_id,
+                    )
 
                 async def on_context_updated() -> None:
                     """
@@ -604,6 +630,11 @@ class PipecatEngine:
             f"Executing node: name: {node.name} allow_interrupt: {node.allow_interrupt} is_end: {node.is_end}"
         )
 
+        # A new node entry earns a fresh opening. Revisiting a node later in the
+        # call is a genuine re-entry and gets its own epoch, so its opening plays
+        # again.
+        self._opening_epoch += 1
+
         # Track previous node for transition event
         previous_node_name = self._current_node.name if self._current_node else None
         previous_node_id = self._current_node.id if self._current_node else None
@@ -686,6 +717,24 @@ class PipecatEngine:
         """Return the greeting info for the start node, or None if not configured."""
         return self.get_node_greeting(self.workflow.start_node_id)
 
+    def _destination_has_recorded_opening(self, node_id: str) -> bool:
+        """Whether entering *node_id* can play a recorded opening right now.
+
+        Mirrors the audio branch of ``queue_node_opening`` so a transition only
+        skips the follow-up LLM generation when that generation is genuinely
+        replaceable. Returning False keeps the existing behaviour untouched.
+        """
+        greeting_info = self.get_node_greeting(node_id)
+        if not greeting_info:
+            return False
+        greeting_type, greeting_value = greeting_info
+        return bool(
+            greeting_type in {"audio", "audio_recording_id"}
+            and greeting_value
+            and self._fetch_recording_audio
+            and self._transport_output is not None
+        )
+
     async def queue_node_opening(
         self,
         *,
@@ -703,6 +752,43 @@ class PipecatEngine:
             "llm" when an initial LLM generation was queued,
             "none" when nothing was queued.
         """
+        async with self._opening_lock:
+            # One LLM response can emit two transition tool calls and pipecat runs
+            # them in parallel, so each gets its own set_node and its own epoch.
+            # Only the node that is still current may speak, otherwise two
+            # questions play over each other and the spoken one may not match the
+            # prompt that actually ended up loaded. Checked *before* the epoch
+            # consume: a loser that consumed it would lock out the winner.
+            if self._current_node is not None and self._current_node.id != node_id:
+                logger.debug(
+                    f"Node {node_id} is no longer current, skipping its opening"
+                )
+                return "none"
+
+            # Consume the epoch before the (potentially slow) recording fetch so a
+            # concurrent handler for the same entry loses the race here rather than
+            # after both have started playing audio.
+            if self._opening_played_epoch == self._opening_epoch:
+                logger.debug(
+                    f"Node opening for {node_id} already handled this entry, skipping"
+                )
+                return "none"
+            self._opening_played_epoch = self._opening_epoch
+
+            return await self._queue_node_opening_locked(
+                node_id=node_id,
+                previous_node_id=previous_node_id,
+                generate_if_no_greeting=generate_if_no_greeting,
+            )
+
+    async def _queue_node_opening_locked(
+        self,
+        *,
+        node_id: str,
+        previous_node_id: Optional[str],
+        generate_if_no_greeting: bool,
+    ) -> Literal["none", "greeting", "llm"]:
+        """Body of queue_node_opening. Callers must hold ``_opening_lock``."""
         if previous_node_id != node_id:
             greeting_info = self.get_node_greeting(node_id)
             if greeting_info:
@@ -844,6 +930,13 @@ class PipecatEngine:
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_is_speaking = False
             self._queued_speech_mute_state = "idle"
+        # Track caller speech. Read only by the recorded-opening path; it
+        # deliberately does not influence the mute decision below, so barge-in
+        # behaviour is unchanged by this.
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            self._user_is_speaking = True
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            self._user_is_speaking = False
 
         # Always mute if pipeline is shutting down
         if self._mute_pipeline:
